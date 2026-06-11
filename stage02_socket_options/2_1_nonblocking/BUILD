@@ -1,5 +1,12 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 cc_binary(
-    name = "main",
-    srcs = ["main.cpp"],
+    name = "server",
+    srcs = ["server.cpp"],
+    linkopts = ["-lpthread"],
+)
+
+cc_binary(
+    name = "client",
+    srcs = ["client.cpp"],
+    linkopts = ["-lpthread"],
 )
