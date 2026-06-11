@@ -3,15 +3,12 @@
 ## Dependency Graph
 
 ```
-1 → 2 → 3 → 4 → 5 → 6      (core path: sockets → epoll → full pattern)
+1 → 2 → 3 → 4 → 5 → 6      (core path: sockets → epoll → callbacks → full pattern)
               ↓
               7 → 8          (io_uring: needs epoll for motivation)
-         ↓
-         9                   (coroutine basics: only needs callbacks from Stage 3)
-              ↓
-              10              (coroutines + epoll: needs Stage 5 + Stage 9)
-                   ↓
-                   11         (coroutines + io_uring: needs Stage 8 + Stage 9)
+         5 → 9               (coroutine basics: needs callbacks from Stage 5)
+    4 + 9 → 10               (coroutines + epoll: needs Stage 4 + Stage 9)
+    8 + 9 → 11               (coroutines + io_uring: needs Stage 8 + Stage 9)
 ```
 
 ## Stage 1 — Raw TCP Sockets (blocking)
@@ -72,11 +69,84 @@ Receive a message and extract the kernel receive timestamp from the `cmsg` ancil
 
 ---
 
-## Stage 3 — Callbacks
+## Stage 3 — epoll in Isolation
+
+**Goal:** understand the epoll API with zero network complexity using pipes.
+
+### Exercise 3.1 — epoll with a single pipe
+Create a pipe. Register the read end with epoll. Write to the write end from a thread. Read in the epoll loop.
+
+```
+pipe(fds) → epoll_create(1) → epoll_ctl(ADD, fds[0], EPOLLIN)
+→ loop: epoll_wait() → read(fds[0])
+```
+
+- Use `epoll_wait(..., timeout=0)` (non-blocking poll)
+- Use `epoll_wait(..., timeout=-1)` (blocking wait)
+- Observe the difference
+
+**What you learn:** `epoll_wait` with timeout=0 is a poll — it returns immediately. timeout=-1 blocks until an event fires. Low-latency code uses timeout=0 in a spin loop.
+
+### Exercise 3.2 — epoll with multiple pipes
+Create 3 pipes. Register all read ends. Write to them in random order from a thread. Verify epoll reports events for each one.
+
+- Store a label per fd using `epoll_event.data.u64` (fd index)
+- Print which pipe fired in what order
+
+**What you learn:** epoll demultiplexes many fds in one call — the fundamental scalability advantage over `select()`/`poll()`.
+
+### Exercise 3.3 — EPOLLET (edge-triggered) vs EPOLLIN (level-triggered)
+Write 5 bytes to a pipe. Call `epoll_wait` twice without reading.
+
+- Level-triggered (default): both calls return an event
+- Edge-triggered (`EPOLLET`): only the first call returns an event
+
+**What you learn:** edge-triggered fires once per state change. You must drain the fd completely or you'll miss data. The book uses `EPOLLET` — this is why the server loops on `accept()` until it gets `EAGAIN`.
+
+### Exercise 3.4 — void* payload in epoll_event
+Store a pointer to a struct in `epoll_event.data.ptr`. Retrieve it on event and call a method on it.
+
+```cpp
+struct Handler { std::string name_; void handle() { ... } };
+Handler h{"pipe-0"};
+ev.data.ptr = &h;
+// on event:
+reinterpret_cast<Handler*>(event.data.ptr)->handle();
+```
+
+**What you learn:** this is the exact trick `TCPServer` uses to recover a `TCPSocket*` from an epoll event — zero-overhead polymorphism via void pointer round-trip.
+
+---
+
+## Stage 4 — epoll + Non-blocking Sockets
+
+**Goal:** replace the pipes from Stage 3 with real TCP sockets.
+
+### Exercise 4.1 — Non-blocking accept loop
+Adapt the server from Stage 1 to use epoll on the listener socket.
+
+- Register the listener fd with `EPOLLIN | EPOLLET`
+- On event, loop `accept()` until `EAGAIN` (drain completely — required for edge-triggered)
+- For each accepted fd, register it with epoll too
+- On data event, `read()` until `EAGAIN`, echo back
+
+**What you learn:** a single thread can handle many clients with no blocking. This is the event loop pattern.
+
+### Exercise 4.2 — EPOLLHUP / EPOLLERR handling
+Kill a client mid-transfer. Detect the disconnection on the server via `EPOLLHUP`.
+
+- On `EPOLLERR | EPOLLHUP`: close the fd, remove from epoll with `EPOLL_CTL_DEL`
+- Verify the server keeps running and accepts new clients
+
+**What you learn:** broken connections must be explicitly removed from epoll or you'll get infinite error events.
+
+---
+
+## Stage 5 — Callbacks
 
 **Goal:** learn `std::function` and inversion-of-control by simulating the TCP 3-way handshake and 4-way teardown as state machines on a deterministic, tick-driven fake network. No real sockets, no threads, no system clock.
 
-This directly motivates Stage 5: after building a fake version of what TCP does internally, the epoll exercises become a matter of wiring the same state transitions to real kernel events.
+This directly motivates Stage 6: after building a fake version of what TCP does internally, the epoll exercises become a matter of wiring the same state transitions to real kernel events.
 
 **Why this teaches callbacks:** endpoints never talk to each other directly — every segment goes through a `send` callback the network intercepts, and every delivery calls a per-endpoint `on_packet` callback the network owns. The callback is the seam; that seam is where fault injection happens.
 
@@ -177,7 +247,7 @@ Teardown (active closer calls `close()`):
 
 ---
 
-### Exercise 3.1 — Deterministic network
+### Exercise 5.1 — Deterministic network
 
 Implement `Network`: `register_endpoint`, `tick`, `drop_next`, and the `send` callable.
 
@@ -189,7 +259,7 @@ Write two tests: (a) send a packet, assert it arrives; (b) call `drop_next()` fi
 
 **What you learn:** callback inversion — endpoints push into a `send` callback and forget. The network owns delivery timing. This is how `TCPServer` decouples I/O readiness from application logic.
 
-### Exercise 3.2 — TCP state machine
+### Exercise 5.2 — TCP state machine
 
 Implement `TcpEndpoint::on_packet()`, `tick()`, `listen()`, `connect()`, and `close()` using the transition tables above.
 
@@ -199,7 +269,7 @@ Wire a client and server through the `Network`. Write two tests:
 
 **What you learn:** a state machine is a struct whose fields encode current state and whose methods are the event handlers. `on_packet` is just a big `switch(state)` — callbacks are how events enter from outside.
 
-### Exercise 3.3 — Fault injection and retransmit
+### Exercise 5.3 — Fault injection and retransmit
 
 Add retransmit logic to `tick()`: if `retransmit_ticks >= retransmit_timeout` and the endpoint is in a state waiting for an ACK, resend `last_sent` and reset `retransmit_ticks`.
 
@@ -215,85 +285,12 @@ Then drive three fault scenarios:
 
 ---
 
-## Stage 4 — epoll in Isolation
-
-**Goal:** understand the epoll API with zero network complexity using pipes.
-
-### Exercise 4.1 — epoll with a single pipe
-Create a pipe. Register the read end with epoll. Write to the write end from a thread. Read in the epoll loop.
-
-```
-pipe(fds) → epoll_create(1) → epoll_ctl(ADD, fds[0], EPOLLIN)
-→ loop: epoll_wait() → read(fds[0])
-```
-
-- Use `epoll_wait(..., timeout=0)` (non-blocking poll)
-- Use `epoll_wait(..., timeout=-1)` (blocking wait)
-- Observe the difference
-
-**What you learn:** `epoll_wait` with timeout=0 is a poll — it returns immediately. timeout=-1 blocks until an event fires. Low-latency code uses timeout=0 in a spin loop.
-
-### Exercise 4.2 — epoll with multiple pipes
-Create 3 pipes. Register all read ends. Write to them in random order from a thread. Verify epoll reports events for each one.
-
-- Store a label per fd using `epoll_event.data.u64` (fd index)
-- Print which pipe fired in what order
-
-**What you learn:** epoll demultiplexes many fds in one call — the fundamental scalability advantage over `select()`/`poll()`.
-
-### Exercise 4.3 — EPOLLET (edge-triggered) vs EPOLLIN (level-triggered)
-Write 5 bytes to a pipe. Call `epoll_wait` twice without reading.
-
-- Level-triggered (default): both calls return an event
-- Edge-triggered (`EPOLLET`): only the first call returns an event
-
-**What you learn:** edge-triggered fires once per state change. You must drain the fd completely or you'll miss data. The book uses `EPOLLET` — this is why the server loops on `accept()` until it gets `EAGAIN`.
-
-### Exercise 4.4 — void* payload in epoll_event
-Store a pointer to a struct in `epoll_event.data.ptr`. Retrieve it on event and call a method on it.
-
-```cpp
-struct Handler { std::string name_; void handle() { ... } };
-Handler h{"pipe-0"};
-ev.data.ptr = &h;
-// on event:
-reinterpret_cast<Handler*>(event.data.ptr)->handle();
-```
-
-**What you learn:** this is the exact trick `TCPServer` uses to recover a `TCPSocket*` from an epoll event — zero-overhead polymorphism via void pointer round-trip.
-
----
-
-## Stage 5 — epoll + Non-blocking Sockets
-
-**Goal:** replace the pipes from Stage 4 with real TCP sockets.
-
-### Exercise 5.1 — Non-blocking accept loop
-Adapt the server from Stage 1 to use epoll on the listener socket.
-
-- Register the listener fd with `EPOLLIN | EPOLLET`
-- On event, loop `accept()` until `EAGAIN` (drain completely — required for edge-triggered)
-- For each accepted fd, register it with epoll too
-- On data event, `read()` until `EAGAIN`, echo back
-
-**What you learn:** a single thread can handle many clients with no blocking. This is the event loop pattern.
-
-### Exercise 5.2 — EPOLLHUP / EPOLLERR handling
-Kill a client mid-transfer. Detect the disconnection on the server via `EPOLLHUP`.
-
-- On `EPOLLERR | EPOLLHUP`: close the fd, remove from epoll with `EPOLL_CTL_DEL`
-- Verify the server keeps running and accepts new clients
-
-**What you learn:** broken connections must be explicitly removed from epoll or you'll get infinite error events.
-
----
-
 ## Stage 6 — Full Pattern: epoll + Sockets + Callbacks
 
 **Goal:** arrive at something equivalent to the book's `TCPSocket` / `TCPServer` but built bottom-up.
 
 ### Exercise 6.1 — Socket wrapper with recv_callback
-Take the non-blocking socket from 5.1. Wrap it in a struct with a `recv_callback_`.
+Take the non-blocking socket from 4.1. Wrap it in a struct with a `recv_callback_`.
 
 ```cpp
 struct Socket {
@@ -328,7 +325,7 @@ Add outbound buffering: `Socket::send(data, len)` copies into a buffer. `Socket:
 
 **Goal:** understand the io_uring submission/completion model using pipes, before any sockets.
 
-**Prerequisite:** Stage 4 (epoll). The motivation for io_uring is understanding what epoll can't do: true async I/O where the kernel does the work and notifies you via a completion queue, without any syscall per operation.
+**Prerequisite:** Stage 3 (epoll). The motivation for io_uring is understanding what epoll can't do: true async I/O where the kernel does the work and notifies you via a completion queue, without any syscall per operation.
 
 ### Exercise 7.1 — Basic SQE/CQE cycle
 Submit a single async `read` on a pipe using io_uring. Wait for the completion.
@@ -362,7 +359,7 @@ Submit 3 reads on 3 pipes in a single `io_uring_submit` call. Collect all 3 comp
 **What you learn:** io_uring's key advantage — N operations submitted with 1 syscall. epoll requires a syscall per `epoll_ctl` add and then `epoll_wait`. io_uring amortises this.
 
 ### Exercise 7.3 — io_uring vs epoll: head-to-head
-Implement the same pipe fan-out from Exercise 4.2 using io_uring instead of epoll.
+Implement the same pipe fan-out from Exercise 3.2 using io_uring instead of epoll.
 
 - Write 10,000 messages across 3 pipes
 - Measure throughput and latency with both approaches using `clock_gettime(CLOCK_MONOTONIC)`
@@ -374,7 +371,7 @@ Implement the same pipe fan-out from Exercise 4.2 using io_uring instead of epol
 
 ## Stage 8 — io_uring + Sockets
 
-**Goal:** replace pipes with TCP sockets, same pattern as the epoll→socket progression in Stages 4→5.
+**Goal:** replace pipes with TCP sockets, same pattern as the epoll→socket progression in Stages 3→4.
 
 ### Exercise 8.1 — Async accept
 Use `io_uring_prep_accept` to accept connections without blocking.
@@ -410,7 +407,7 @@ Register a buffer pool with `io_uring_register_buffers`. Use `prep_read_fixed` i
 
 **Goal:** understand C++20 coroutines as a language feature, in complete isolation from networking.
 
-**Prerequisite:** Stage 3 (callbacks). Coroutines are structured callbacks — instead of passing a function to call when work is done, you write code that suspends itself and resumes later. Same idea, radically different syntax.
+**Prerequisite:** Stage 5 (callbacks). Coroutines are structured callbacks — instead of passing a function to call when work is done, you write code that suspends itself and resumes later. Same idea, radically different syntax.
 
 ### Exercise 9.1 — Generator with co_yield
 Write a coroutine that generates a Fibonacci sequence using `co_yield`.
@@ -464,9 +461,9 @@ Implement `Task<int>` where `co_return 42` stores the value and the caller retri
 
 ## Stage 10 — Coroutines + epoll
 
-**Goal:** wire the coroutine machinery from Stage 9 to the epoll event loop from Stage 5.
+**Goal:** wire the coroutine machinery from Stage 9 to the epoll event loop from Stage 4.
 
-**Prerequisites:** Stage 5 (epoll + sockets) + Stage 9 (coroutine basics).
+**Prerequisites:** Stage 4 (epoll + sockets) + Stage 9 (coroutine basics).
 
 ### Exercise 10.1 — Awaitable fd read
 Write an `AsyncRead` awaitable that suspends a coroutine until epoll signals a fd is readable.
@@ -484,7 +481,7 @@ Task<ssize_t> async_read(EventLoop& loop, int fd, char* buf, size_t len) {
 **What you learn:** epoll becomes the scheduler. The coroutine handle replaces the `recv_callback_` — instead of registering a lambda, you register a suspended coroutine.
 
 ### Exercise 10.2 — Coroutine echo server
-Rewrite the echo server from Stage 5 using coroutines. Each connection gets its own coroutine.
+Rewrite the echo server from Stage 4 using coroutines. Each connection gets its own coroutine.
 
 ```cpp
 Task<void> handle_connection(EventLoop& loop, int fd) {
@@ -534,4 +531,3 @@ Port the coroutine echo server from 10.2 to use io_uring instead of epoll.
 - Try chaining: submit the next recv SQE in the send completion (linked SQEs via `IOSQE_IO_LINK`)
 
 **What you learn:** with io_uring + coroutines, the server is: submit work → sleep → work arrives → continue. No readiness polling, no manual non-blocking loops, no `EAGAIN`. The closest thing to blocking code that is actually async.
-
