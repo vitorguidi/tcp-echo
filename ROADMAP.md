@@ -77,7 +77,7 @@ Receive a message and extract the kernel receive timestamp from the `cmsg` ancil
 Create a pipe. Register the read end with epoll. Write to the write end from a thread. Read in the epoll loop.
 
 ```
-pipe(fds) → epoll_create(1) → epoll_ctl(ADD, fds[0], EPOLLIN)
+pipe(fds) → epoll_create(1) → epoll_ctl(epfd, EPOLL_CTL_ADD, fds[0], &ev{EPOLLIN})
 → loop: epoll_wait() → read(fds[0])
 ```
 
