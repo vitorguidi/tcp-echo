@@ -87,15 +87,7 @@ pipe(fds) → epoll_create(1) → epoll_ctl(epfd, EPOLL_CTL_ADD, fds[0], &ev{EPO
 
 **What you learn:** `epoll_wait` with timeout=0 is a poll — it returns immediately. timeout=-1 blocks until an event fires. Low-latency code uses timeout=0 in a spin loop.
 
-### Exercise 3.2 — epoll with multiple pipes
-Create 3 pipes. Register all read ends. Write to them in random order from a thread. Verify epoll reports events for each one.
-
-- Store a label per fd using `epoll_event.data.u64` (fd index)
-- Print which pipe fired in what order
-
-**What you learn:** epoll demultiplexes many fds in one call — the fundamental scalability advantage over `select()`/`poll()`.
-
-### Exercise 3.3 — EPOLLET (edge-triggered) vs EPOLLIN (level-triggered)
+### Exercise 3.2 — EPOLLET (edge-triggered) vs EPOLLIN (level-triggered)
 Write 5 bytes to a pipe. Call `epoll_wait` twice without reading.
 
 - Level-triggered (default): both calls return an event
@@ -103,7 +95,7 @@ Write 5 bytes to a pipe. Call `epoll_wait` twice without reading.
 
 **What you learn:** edge-triggered fires once per state change. You must drain the fd completely or you'll miss data. The book uses `EPOLLET` — this is why the server loops on `accept()` until it gets `EAGAIN`.
 
-### Exercise 3.4 — void* payload in epoll_event
+### Exercise 3.3 — void* payload in epoll_event
 Store a pointer to a struct in `epoll_event.data.ptr`. Retrieve it on event and call a method on it.
 
 ```cpp
