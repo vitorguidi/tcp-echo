@@ -134,146 +134,105 @@ Kill a client mid-transfer. Detect the disconnection on the server via `EPOLLHUP
 
 ---
 
-## Stage 5 — Callbacks
+## Stage 5 — Callbacks and Event Loops
 
-**Goal:** learn `std::function` and inversion-of-control by simulating the TCP 3-way handshake and 4-way teardown as state machines on a deterministic, tick-driven fake network. No real sockets, no threads, no system clock.
+**Goal:** learn `std::function` and inversion-of-control through a pure-C++ event loop — no sockets, no threads, no system clock.
 
-This directly motivates Stage 6: after building a fake version of what TCP does internally, the epoll exercises become a matter of wiring the same state transitions to real kernel events.
+**Core idea:** instead of a function *returning* a value, it accepts a callback — a `std::function` to call *when the value is ready*. The event loop owns the *when*; your code owns the *what*.
 
-**Why this teaches callbacks:** endpoints never talk to each other directly — every segment goes through a `send` callback the network intercepts, and every delivery calls a per-endpoint `on_packet` callback the network owns. The callback is the seam; that seam is where fault injection happens.
+This directly motivates Stage 6 (epoll wires the same callback pattern to real kernel events) and Stage 9 (C++20 coroutines are structured callbacks with a compiler-generated state machine).
 
 ---
 
-### Interfaces to implement
+### Exercise 5.1 — FIFO dispatch loop
+
+Implement `EventLoop::post()` and `EventLoop::run()`.
 
 ```cpp
-// ── Packet ────────────────────────────────────────────────────────────────────
+struct EventLoop {
+    std::queue<std::function<void()>> ready_;
 
-enum class Segment : uint8_t { SYN, SYN_ACK, ACK, FIN, RST };
-
-struct Packet {
-    uint8_t from;
-    uint8_t to;
-    Segment seg;
-};
-
-// ── Network ───────────────────────────────────────────────────────────────────
-//
-// Endpoints never call each other. They call send(), which queues the packet.
-// tick() delivers all queued packets by calling each recipient's on_packet
-// callback. drop_next() silently discards the next enqueued packet.
-
-struct Network {
-    std::function<void(const Packet&)> send;  // called by endpoints
-
-    void register_endpoint(uint8_t id, std::function<void(const Packet&)> on_packet);
-    void tick();        // deliver all queued packets
-    void drop_next();   // discard the next packet (fault injection)
-
-private:
-    std::vector<Packet>                                queue_;
-    std::vector<std::function<void(const Packet&)>>   recv_cbs_;
-    bool                                               drop_next_ = false;
-};
-
-// ── TcpEndpoint ───────────────────────────────────────────────────────────────
-//
-// Models one side of a TCP connection as a state machine.
-// Advances in response to two events: tick() and on_packet().
-
-enum class TcpState : uint8_t {
-    Closed, Listen, SynSent, SynReceived, Established,
-    FinWait1, FinWait2, TimeWait, CloseWait, LastAck,
-};
-
-struct TcpEndpoint {
-    uint8_t  id;
-    uint8_t  peer_id;
-    TcpState state = TcpState::Closed;
-
-    // Wiring — set by the harness.
-    std::function<void(const Packet&)> send;
-
-    // Application callbacks — fire on state transitions.
-    std::function<void()> on_connected;   // fires when state → Established
-    std::function<void()> on_closed;      // fires when state → Closed
-
-    // Retransmit state.
-    int      retransmit_ticks   = 0;
-    int      retransmit_timeout = 3;      // ticks before resending last segment
-    Segment  last_sent;                   // segment to retransmit on timeout
-
-    // ── API ──
-    void listen();    // server side: Closed → Listen
-    void connect();   // client side: Closed → SynSent, sends SYN
-    void close();     // either side: initiates FIN exchange from Established
-
-    // ── Events ──
-    void tick();                     // advance retransmit timer
-    void on_packet(const Packet& p); // state machine: react to incoming segment
+    void post(std::function<void()> cb);  // enqueue cb; runs on the next run() iteration
+    void run();                            // drain ready_ until empty; callbacks may post more
 };
 ```
 
-**State transition tables** — implement these exactly:
+Implement `task(loop, name, step, total)`: prints its step, then posts itself back to the loop if more steps remain.
 
-Connection setup:
+Expected output:
+```
+[A] step 1/3
+[B] step 1/3
+[A] step 2/3
+[B] step 2/3
+[A] step 3/3
+[B] step 3/3
+```
 
-| State | Segment received | Next state | Send |
-|---|---|---|---|
-| `Listen` | `SYN` | `SynReceived` | `SYN_ACK` |
-| `SynSent` | `SYN_ACK` | `Established` → fire `on_connected` | `ACK` |
-| `SynReceived` | `ACK` | `Established` → fire `on_connected` | — |
-| any | `RST` | `Closed` → fire `on_closed` | — |
+**What you learn:** `post()` is a cooperative yield — the caller relinquishes control back to the loop, which decides what runs next. Two logical tasks share one thread with zero synchronization. This is how every async runtime (Node.js, Tokio, asyncio) works at its core.
 
-Teardown (active closer calls `close()`):
+### Exercise 5.2 — Tick-based scheduler (priority queue)
 
-| State | Event / Segment | Next state | Send |
-|---|---|---|---|
-| `Established` | `close()` called | `FinWait1` | `FIN` |
-| `FinWait1` | `ACK` | `FinWait2` | — |
-| `FinWait2` | `FIN` | `TimeWait` | `ACK` |
-| `TimeWait` | 2 × `retransmit_timeout` ticks elapsed | `Closed` → fire `on_closed` | — |
-| `Established` | `FIN` (passive closer) | `CloseWait` | `ACK` |
-| `CloseWait` | `close()` called | `LastAck` | `FIN` |
-| `LastAck` | `ACK` | `Closed` → fire `on_closed` | — |
+Extend `EventLoop` with `schedule(delay, cb)` and a tick counter.
 
----
+```cpp
+struct EventLoop {
+    struct Entry {
+        int tick;
+        std::function<void()> cb;
+        bool operator>(const Entry& o) const { return tick > o.tick; }
+    };
 
-### Exercise 5.1 — Deterministic network
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> pq_;
+    int tick_ = 0;
 
-Implement `Network`: `register_endpoint`, `tick`, `drop_next`, and the `send` callable.
+    void schedule(int delay, std::function<void()> cb);  // enqueue at tick_ + delay
+    void run();  // jump to next due tick, fire all callbacks there, repeat
+};
+```
 
-- `tick()` drains `queue_` in FIFO order, calling each recipient's callback
-- Packets generated by callbacks during delivery go into a fresh queue for the next tick (avoids reentrancy)
-- `drop_next()` sets a flag; the next `send()` call discards the packet instead of queuing it
+- `schedule(delay, cb)` stores `(tick_ + delay, cb)` in the min-heap
+- `run()` jumps `tick_` to the next due deadline, fires all callbacks at that tick, repeats
+- Callbacks may call `schedule()` — newly added items land in the heap for future ticks
 
-Write two tests: (a) send a packet, assert it arrives; (b) call `drop_next()` first, assert it does not.
+Implement the recurring `ping`: prints its number and re-schedules itself until `n == 3`.
 
-**What you learn:** callback inversion — endpoints push into a `send` callback and forget. The network owns delivery timing. This is how `TCPServer` decouples I/O readiness from application logic.
+Expected output (registration order does not matter — only deadlines do):
+```
+[tick 1] ping #1
+[tick 2] retry
+[tick 4] ping #2
+[tick 5] heartbeat
+[tick 7] ping #3
+[tick 8] timeout
+```
 
-### Exercise 5.2 — TCP state machine
+**What you learn:** a priority queue is a scheduler. The same structure underlies every timer wheel, `setTimeout` implementation, and deadline-aware event loop. Jumping `tick_` to the next due entry — rather than advancing one tick at a time — is the "skip idle ticks" optimisation all real runtimes use.
 
-Implement `TcpEndpoint::on_packet()`, `tick()`, `listen()`, `connect()`, and `close()` using the transition tables above.
+### Exercise 5.3 — Simulated coroutine via continuation-passing
 
-Wire a client and server through the `Network`. Write two tests:
-- **Handshake:** call `server.listen()`, then `client.connect()`. Run `tick()` in a loop until both `on_connected` callbacks have fired. Assert both endpoints are in `Established`.
-- **Teardown:** from `Established`, call `client.close()`. Run `tick()` until both `on_closed` callbacks fire. Assert both are in `Closed`.
+Using the tick-based `EventLoop` (provided at the top of the file), implement three functions:
 
-**What you learn:** a state machine is a struct whose fields encode current state and whose methods are the event handlers. `on_packet` is just a big `switch(state)` — callbacks are how events enter from outside.
+```cpp
+// Completes after 3 ticks; calls on_done with the raw data string.
+void async_read_disk(EventLoop& loop, std::function<void(std::string)> on_done);
 
-### Exercise 5.3 — Fault injection and retransmit
+// Completes after 2 ticks; calls on_done with the processed result string.
+void async_process(EventLoop& loop, std::string raw, std::function<void(std::string)> on_done);
 
-Add retransmit logic to `tick()`: if `retransmit_ticks >= retransmit_timeout` and the endpoint is in a state waiting for an ACK, resend `last_sent` and reset `retransmit_ticks`.
+// Chains the two operations using nested callbacks, then calls on_result.
+void pipeline(EventLoop& loop, std::function<void(std::string)> on_result);
+```
 
-Then drive three fault scenarios:
+The equivalent coroutine body is already in the file as a comment. Your job is to write the callback version that produces the same result:
 
-1. **Lost SYN-ACK** — call `drop_next()` after the SYN is sent. Assert the client retransmits the SYN and the handshake completes on the second attempt.
+```
+[tick 0] read_disk: submitted (latency = 3 ticks)
+[tick 3] process: submitted (latency = 2 ticks)
+[tick 5] pipeline done: ...
+```
 
-2. **Lost FIN-ACK** — drop the ACK during teardown. Assert the active closer retransmits FIN and teardown completes.
-
-3. **RST injection** — from `Established`, enqueue an RST packet manually. Assert both endpoints fire `on_closed` and move to `Closed` without going through the normal teardown.
-
-**What you learn:** the retransmit timer lives in `tick()`, the state transitions live in `on_packet()` — two separate callbacks, clean separation of concerns. This mirrors how the book's `TCPServer` separates `recv_callback_` (per-packet) from `recv_finished_callback_` (batch-done). Fault injection is free because the network is a pure data structure — no real kernel, no timing, no flakiness.
+**What you learn:** each nested lambda in `pipeline` is a *resume point* — the code the coroutine executes after it wakes up. The lambda's capture list is the coroutine's saved stack frame. `co_await` in Stage 9 has the compiler generate exactly this nesting automatically; here you write it by hand so the transformation is not magic.
 
 ---
 
