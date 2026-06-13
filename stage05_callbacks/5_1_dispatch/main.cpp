@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <functional>
 #include <queue>
+#include <iostream>
 
 struct EventLoop {
     std::queue<std::function<void()>> ready_;
@@ -9,9 +10,26 @@ struct EventLoop {
     void run();                            // drain ready_ until empty; callbacks may post more
 };
 
+void EventLoop::post(std::function<void()> cb) {
+    ready_.push(cb);
+}
+
+void EventLoop::run() {
+    while (!ready_.empty()) {
+        auto cb = ready_.front();
+        ready_.pop();
+        cb();
+    }
+}
+
 // Print the current step, then post itself back to the loop if more steps remain.
 // A and B share the same loop — interleaving emerges from FIFO order.
-void task(EventLoop& loop, char name, int step, int total);
+void task(EventLoop& loop, char name, int step, int total) {
+    std::cout << name << step << std::endl;
+    if (step < total) {
+        loop.post([&loop, name, step, total] { task(loop, name, step + 1, total); });
+    }
+}
 
 int main() {
     EventLoop loop;
