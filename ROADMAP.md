@@ -3,12 +3,16 @@
 ## Dependency Graph
 
 ```
-1 → 2 → 3 → 4 → 5 → 6      (core path: sockets → epoll → callbacks → full pattern)
+1 → 2 → 3 → 4 → 5          (core path: sockets → epoll → callbacks)
               ↓
-              7 → 8          (io_uring: needs epoll for motivation)
-         5 → 9               (coroutine basics: needs callbacks from Stage 5)
-    4 + 9 → 10               (coroutines + epoll: needs Stage 4 + Stage 9)
-    8 + 9 → 11               (coroutines + io_uring: needs Stage 8 + Stage 9)
+              6 → 7          (io_uring: needs epoll for motivation)
+         5 → 8               (coroutine basics: needs callbacks from Stage 5)
+    4 + 8 → 9                (coroutines + epoll)
+    7 + 8 → 10               (coroutines + io_uring)
+         4 → 11              (full echo server: epoll)
+         7 → 12              (full echo server: io_uring)
+         9 → 13              (full echo server: coroutines + epoll)
+        10 → 14              (full echo server: coroutines + io_uring)
 ```
 
 ## Stage 1 — Raw TCP Sockets (blocking)
@@ -114,23 +118,18 @@ reinterpret_cast<Handler*>(event.data.ptr)->handle();
 
 **Goal:** replace the pipes from Stage 3 with real TCP sockets.
 
-### Exercise 4.1 — Non-blocking accept loop
+### Exercise 4.1 — Non-blocking accept loop with disconnect handling
 Adapt the server from Stage 1 to use epoll on the listener socket.
 
 - Register the listener fd with `EPOLLIN | EPOLLET`
 - On event, loop `accept()` until `EAGAIN` (drain completely — required for edge-triggered)
 - For each accepted fd, register it with epoll too
 - On data event, `read()` until `EAGAIN`, echo back
-
-**What you learn:** a single thread can handle many clients with no blocking. This is the event loop pattern.
-
-### Exercise 4.2 — EPOLLHUP / EPOLLERR handling
-Kill a client mid-transfer. Detect the disconnection on the server via `EPOLLHUP`.
-
 - On `EPOLLERR | EPOLLHUP`: close the fd, remove from epoll with `EPOLL_CTL_DEL`
-- Verify the server keeps running and accepts new clients
+- On `recv()` returning 0 (clean FIN): same cleanup as above
+- Force an abrupt disconnect with `ss -K dst 127.0.0.1 dport = <port>` and verify the server keeps running
 
-**What you learn:** broken connections must be explicitly removed from epoll or you'll get infinite error events.
+**What you learn:** a single thread can handle many clients with no blocking. Broken connections must be explicitly removed from epoll or you'll get infinite error events. Clean shutdown (FIN) arrives as `EPOLLIN` with `recv() == 0`; abrupt teardown (RST) arrives as `EPOLLHUP`.
 
 ---
 
@@ -140,7 +139,7 @@ Kill a client mid-transfer. Detect the disconnection on the server via `EPOLLHUP
 
 **Core idea:** instead of a function *returning* a value, it accepts a callback — a `std::function` to call *when the value is ready*. The event loop owns the *when*; your code owns the *what*.
 
-This directly motivates Stage 6 (epoll wires the same callback pattern to real kernel events) and Stage 9 (C++20 coroutines are structured callbacks with a compiler-generated state machine).
+This directly motivates Stage 9 (C++20 coroutines are structured callbacks with a compiler-generated state machine).
 
 ---
 
@@ -234,53 +233,17 @@ Expected output:
 [tick 5] pipeline done: alice (id=42) scored 99
 ```
 
-**What you learn:** each nested lambda in `pipeline` is a *resume point*. The value produced by one stage (`raw`) flows to the next as a captured variable — the closure keeps it alive across the tick gap, exactly as a coroutine frame keeps local variables alive across a `co_await`. In Stage 9, the compiler generates this closure and nesting automatically; here you write it by hand so the transformation is not magic.
+**What you learn:** each nested lambda in `pipeline` is a *resume point*. The value produced by one stage (`raw`) flows to the next as a captured variable — the closure keeps it alive across the tick gap, exactly as a coroutine frame keeps local variables alive across a `co_await`. In Stage 8, the compiler generates this closure and nesting automatically; here you write it by hand so the transformation is not magic.
 
 ---
 
-## Stage 6 — Full Pattern: epoll + Sockets + Callbacks
-
-**Goal:** arrive at something equivalent to the book's `TCPSocket` / `TCPServer` but built bottom-up.
-
-### Exercise 6.1 — Socket wrapper with recv_callback
-Take the non-blocking socket from 4.1. Wrap it in a struct with a `recv_callback_`.
-
-```cpp
-struct Socket {
-    int fd_;
-    std::function<void(Socket*, std::string_view)> on_recv_;
-    bool recv();  // reads available data, calls on_recv_, returns true if data read
-};
-```
-
-**What you learn:** the callback wrapper is just a struct holding an fd and a `std::function`. All the book's complexity follows from this.
-
-### Exercise 6.2 — Server with per-socket callbacks
-Write a `Server` that:
-1. Listens with epoll
-2. On new connection: creates a `Socket`, assigns a callback, registers with epoll
-3. On data: calls the socket's `on_recv_`
-4. On disconnect: cleans up
-
-**What you learn:** this is exactly `TCPServer::poll()` + `TCPServer::sendAndRecv()` — you've now reconstructed the book's design from first principles.
-
-### Exercise 6.3 — Send buffering
-Add outbound buffering: `Socket::send(data, len)` copies into a buffer. `Socket::flush()` writes it out.
-
-- Call `flush()` from the epoll loop after processing all reads
-- Observe that batching sends reduces syscall count
-
-**What you learn:** this is `TCPSocket::send()` + `sendAndRcv()`. Decoupling "I want to send" from "actually write to the wire" lets you coalesce multiple logical messages into one syscall.
-
----
-
-## Stage 7 — io_uring in Isolation
+## Stage 6 — io_uring in Isolation
 
 **Goal:** understand the io_uring submission/completion model using pipes, before any sockets.
 
 **Prerequisite:** Stage 3 (epoll). The motivation for io_uring is understanding what epoll can't do: true async I/O where the kernel does the work and notifies you via a completion queue, without any syscall per operation.
 
-### Exercise 7.1 — Basic SQE/CQE cycle
+### Exercise 6.1 — Basic SQE/CQE cycle
 Submit a single async `read` on a pipe using io_uring. Wait for the completion.
 
 ```cpp
@@ -302,7 +265,7 @@ io_uring_cqe_seen(&ring, cqe);
 
 **What you learn:** the core io_uring contract — submit ops to the SQ (submission queue), kernel executes them, completions appear in the CQ (completion queue). Zero syscalls after `io_uring_submit` until you call `io_uring_wait_cqe`.
 
-### Exercise 7.2 — Batching: multiple ops in one submit
+### Exercise 6.2 — Batching: multiple ops in one submit
 Submit 3 reads on 3 pipes in a single `io_uring_submit` call. Collect all 3 completions.
 
 - Set `sqe->user_data` to the pipe index on each SQE
@@ -311,7 +274,7 @@ Submit 3 reads on 3 pipes in a single `io_uring_submit` call. Collect all 3 comp
 
 **What you learn:** io_uring's key advantage — N operations submitted with 1 syscall. epoll requires a syscall per `epoll_ctl` add and then `epoll_wait`. io_uring amortises this.
 
-### Exercise 7.3 — io_uring vs epoll: head-to-head
+### Exercise 6.3 — io_uring vs epoll: head-to-head
 Implement the same pipe fan-out from Exercise 3.2 using io_uring instead of epoll.
 
 - Write 10,000 messages across 3 pipes
@@ -322,11 +285,11 @@ Implement the same pipe fan-out from Exercise 3.2 using io_uring instead of epol
 
 ---
 
-## Stage 8 — io_uring + Sockets
+## Stage 7 — io_uring + Sockets
 
 **Goal:** replace pipes with TCP sockets, same pattern as the epoll→socket progression in Stages 3→4.
 
-### Exercise 8.1 — Async accept
+### Exercise 7.1 — Async accept
 Use `io_uring_prep_accept` to accept connections without blocking.
 
 - Submit an accept SQE on the listener fd
@@ -335,7 +298,7 @@ Use `io_uring_prep_accept` to accept connections without blocking.
 
 **What you learn:** with io_uring, accept is just another async op — no special listener loop, no `EAGAIN` handling. The kernel queues the next accept for you.
 
-### Exercise 8.2 — Async echo server
+### Exercise 7.2 — Async echo server
 Build a full echo server using only io_uring ops: `prep_accept` → `prep_recv` → `prep_send`.
 
 - On accept completion: submit a recv SQE for the new fd
@@ -345,7 +308,7 @@ Build a full echo server using only io_uring ops: `prep_accept` → `prep_recv` 
 
 **What you learn:** io_uring turns the event loop inside-out — instead of "wait for readiness then call syscall", you submit the I/O op upfront and react to completion. This matches how hardware DMA works.
 
-### Exercise 8.3 — Fixed buffers
+### Exercise 7.3 — Fixed buffers
 Register a buffer pool with `io_uring_register_buffers`. Use `prep_read_fixed` instead of `prep_read`.
 
 - Allocate 4 buffers of 4KB each, register them
@@ -356,13 +319,13 @@ Register a buffer pool with `io_uring_register_buffers`. Use `prep_read_fixed` i
 
 ---
 
-## Stage 9 — Coroutine Basics
+## Stage 8 — Coroutine Basics
 
 **Goal:** understand C++20 coroutines as a language feature, in complete isolation from networking.
 
 **Prerequisite:** Stage 5 (callbacks). Coroutines are structured callbacks — instead of passing a function to call when work is done, you write code that suspends itself and resumes later. Same idea, radically different syntax.
 
-### Exercise 9.1 — Generator with co_yield
+### Exercise 8.1 — Generator with co_yield
 Write a coroutine that generates a Fibonacci sequence using `co_yield`.
 
 ```cpp
@@ -380,7 +343,7 @@ Generator<int> fibonacci() {
 
 **What you learn:** the coroutine machinery — `promise_type` controls suspension/resumption, `coroutine_handle` is the resume token, `co_yield` suspends and hands a value to the caller.
 
-### Exercise 9.2 — Custom awaiter with co_await
+### Exercise 8.2 — Custom awaiter with co_await
 Write an `Awaitable` that suspends a coroutine and resumes it after a condition is met.
 
 ```cpp
@@ -402,7 +365,7 @@ Task<void> my_coro() {
 
 **What you learn:** `await_ready/suspend/resume` are the three hooks the compiler calls at a `co_await`. The coroutine handle is the "callback" — you store it and call it when you're ready. This is callbacks with better syntax.
 
-### Exercise 9.3 — Task<T> with return value
+### Exercise 8.3 — Task<T> with return value
 Implement `Task<int>` where `co_return 42` stores the value and the caller retrieves it.
 
 - Chain two coroutines: `Task<int> inner()` returns a value, `Task<void> outer()` does `int x = co_await inner()`
@@ -412,13 +375,13 @@ Implement `Task<int>` where `co_return 42` stores the value and the caller retri
 
 ---
 
-## Stage 10 — Coroutines + epoll
+## Stage 9 — Coroutines + epoll
 
-**Goal:** wire the coroutine machinery from Stage 9 to the epoll event loop from Stage 4.
+**Goal:** wire the coroutine machinery from Stage 8 to the epoll event loop from Stage 4.
 
-**Prerequisites:** Stage 4 (epoll + sockets) + Stage 9 (coroutine basics).
+**Prerequisites:** Stage 4 (epoll + sockets) + Stage 8 (coroutine basics).
 
-### Exercise 10.1 — Awaitable fd read
+### Exercise 9.1 — Awaitable fd read
 Write an `AsyncRead` awaitable that suspends a coroutine until epoll signals a fd is readable.
 
 ```cpp
@@ -431,9 +394,9 @@ Task<ssize_t> async_read(EventLoop& loop, int fd, char* buf, size_t len) {
 - `wait_readable(fd)` registers the fd with epoll and stores the coroutine handle
 - When epoll fires, the event loop calls `handle.resume()`
 
-**What you learn:** epoll becomes the scheduler. The coroutine handle replaces the `recv_callback_` — instead of registering a lambda, you register a suspended coroutine.
+**What you learn:** epoll becomes the scheduler. The coroutine handle replaces a registered callback — instead of registering a lambda, you register a suspended coroutine.
 
-### Exercise 10.2 — Coroutine echo server
+### Exercise 9.2 — Coroutine echo server
 Rewrite the echo server from Stage 4 using coroutines. Each connection gets its own coroutine.
 
 ```cpp
@@ -447,20 +410,20 @@ Task<void> handle_connection(EventLoop& loop, int fd) {
 }
 ```
 
-- Compare the code length and structure with the callback version from Stage 6
-- Both do the same thing — observe how coroutines eliminate the state machine
+- Compare code length and structure with the raw epoll version from Stage 4
+- Observe how coroutines eliminate manual fd-to-state routing
 
-**What you learn:** callbacks require you to manually split your logic across multiple functions and store intermediate state externally. Coroutines let the compiler generate that state machine for you. The sequential-looking code IS the state machine.
+**What you learn:** in Stage 4 you manually tracked which fd was readable and dispatched to the right handler. Here the coroutine frame *is* the per-connection state — no routing map, no split across multiple functions. The sequential-looking code IS the state machine.
 
 ---
 
-## Stage 11 — Coroutines + io_uring
+## Stage 10 — Coroutines + io_uring
 
 **Goal:** replace the epoll event loop with io_uring as the coroutine scheduler.
 
-**Prerequisites:** Stage 8 (io_uring + sockets) + Stage 9 (coroutine basics).
+**Prerequisites:** Stage 7 (io_uring + sockets) + Stage 8 (coroutine basics).
 
-### Exercise 11.1 — Awaitable io_uring op
+### Exercise 10.1 — Awaitable io_uring op
 Write an `IoUringAwaitable` that submits an SQE and suspends until the CQE arrives.
 
 ```cpp
@@ -476,11 +439,174 @@ Task<ssize_t> async_read(IoUringLoop& loop, int fd, char* buf, size_t len) {
 
 **What you learn:** io_uring and coroutines are a natural fit — the CQE is a completion notification, the coroutine handle is the continuation. `user_data` is the glue. No callbacks, no lambdas.
 
-### Exercise 11.2 — Coroutine echo server with io_uring
-Port the coroutine echo server from 10.2 to use io_uring instead of epoll.
+### Exercise 10.2 — Coroutine echo server with io_uring
+Port the coroutine echo server from 9.2 to use io_uring instead of epoll.
 
 - `async_accept`, `async_recv`, `async_send` all submit SQEs
 - The loop just drains CQEs and resumes handles
 - Try chaining: submit the next recv SQE in the send completion (linked SQEs via `IOSQE_IO_LINK`)
 
 **What you learn:** with io_uring + coroutines, the server is: submit work → sleep → work arrives → continue. No readiness polling, no manual non-blocking loops, no `EAGAIN`. The closest thing to blocking code that is actually async.
+
+---
+
+## Stage 11 — Full Echo Server: epoll
+
+**Goal:** build a complete, benchmarkable echo server using epoll, integrating everything from Stages 3 and 4 into a clean implementation.
+
+**Prerequisite:** Stage 4 (epoll + non-blocking sockets).
+
+### Exercise 11.1 — Structured server
+
+Bring the non-blocking accept loop (4.1), disconnect handling (4.2), and send buffering together into a single struct.
+
+```cpp
+struct ConnState {
+    int fd;
+    std::vector<std::byte> send_buf;
+};
+
+struct EchoServer {
+    int epfd_;
+    int listen_fd_;
+    std::unordered_map<int, ConnState> conns_;
+
+    void run();
+private:
+    void on_accept();
+    void on_recv(int fd);
+    void on_close(int fd);
+    void flush_all();
+};
+```
+
+Steps:
+- `on_accept()`: drain `accept()` until `EAGAIN`; for each new fd set non-blocking, register with `EPOLLIN | EPOLLET`, insert into `conns_`
+- `on_recv(fd)`: `read()` in a loop until `EAGAIN`; append data to `conns_[fd].send_buf` — do not write to the fd directly
+- After processing all events in the current `epoll_wait` batch: call `flush_all()`, which loops over every conn with a non-empty `send_buf` and calls `write()` until `EAGAIN` or empty
+- `on_close(fd)`: `epoll_ctl(EPOLL_CTL_DEL)`, erase from `conns_` (destructor closes fd)
+- On `EPOLLHUP | EPOLLERR` or `on_recv` reading 0 bytes: call `on_close`
+
+**What you learn:** `flush_all()` after the read pass means each epoll batch produces at most one `write()` syscall per connection — all incoming data for a connection is accumulated first, then flushed. This is why send buffering belongs at the event loop level, not inside the read handler.
+
+### Exercise 11.2 — Load test
+
+Write a benchmark client that opens N connections and sends M 1 KB messages per connection in a tight loop. Measure:
+
+- Total throughput (messages/second)
+- Round-trip latency p50 and p99 using `clock_gettime(CLOCK_MONOTONIC)`
+
+Run with N = 1, 10, 100, 1000. Compare against Stage 1.2 (thread-per-connection).
+
+Expected: the epoll server handles 1000 concurrent connections without degradation. The thread-per-connection server from 1.2 exhausts stack memory or thrashes the scheduler well before that.
+
+---
+
+## Stage 12 — Full Echo Server: io_uring
+
+**Goal:** same echo server as Stage 11 using io_uring. Direct apples-to-apples comparison.
+
+**Prerequisite:** Stage 7 (io_uring + sockets).
+
+### Exercise 12.1 — Completion-based server
+
+```cpp
+enum class Op { Accept, Recv, Send };
+
+struct ConnState {
+    int fd;
+    Op pending;
+    std::array<std::byte, 4096> buf;
+};
+```
+
+Steps:
+- Submit one accept SQE on startup with `user_data = nullptr`
+- On accept CQE: allocate `ConnState` for the new fd, submit recv SQE with `user_data = &conn`; re-submit the accept SQE
+- On recv CQE (`conn->pending == Recv`): if `n > 0` submit send SQE with same data; if `n <= 0` free `ConnState` and close
+- On send CQE (`conn->pending == Send`): submit next recv SQE (loop)
+
+**What you learn:** every event drives the next op submission. There is no polling loop checking readiness — the kernel tells you when the op completed and what the result was. The `user_data` pointer is the routing mechanism, same role as `epoll_event.data.ptr` in Stage 11.
+
+### Exercise 12.2 — Fixed buffers
+
+Register a pool of 16 buffers of 4 KB each with `io_uring_register_buffers`. Assign round-robin per connection. Use `prep_recv_fixed` / `prep_send_fixed`.
+
+Compare throughput and syscall count (`strace -c`) with 12.1.
+
+### Exercise 12.3 — Benchmark vs Stage 11
+
+Run the same load test from 11.2 against both servers. Compare:
+
+- Throughput and latency numbers
+- Total syscall count from `strace -c` — expect io_uring to show ~3× fewer syscalls at high concurrency
+
+---
+
+## Stage 13 — Full Coroutine Echo Server: epoll
+
+**Goal:** replace the manual per-connection state struct and routing from Stage 11 with one coroutine per connection.
+
+**Prerequisite:** Stage 9 (coroutines + epoll).
+
+### Exercise 13.1 — Coroutine per connection
+
+```cpp
+Task<void> handle(EpollLoop& loop, int fd) {
+    std::array<std::byte, 4096> buf;
+    while (true) {
+        auto n = co_await loop.recv(fd, buf.data(), buf.size());
+        if (n <= 0) break;
+        co_await loop.send(fd, buf.data(), n);
+    }
+    ::close(fd);
+}
+```
+
+Spawn a `handle()` coroutine for each accepted fd. Compare code structure with Stage 11:
+
+- Stage 11 requires `ConnState`, `on_recv`, `on_close`, `flush_all`, and routing by fd
+- Stage 13 has none of that — the coroutine frame holds the buffer and the fd, control flow reads sequentially
+
+**What you learn:** the coroutine frame *is* the connection state. The compiler generates the state machine that Stage 11 required you to write by hand. Connection lifetime is tied to the coroutine lifetime — cleanup happens when the coroutine returns.
+
+---
+
+## Stage 14 — Full Coroutine Echo Server: io_uring
+
+**Goal:** same as Stage 13 but with io_uring as the scheduler. The coroutine body is unchanged.
+
+**Prerequisite:** Stage 10 (coroutines + io_uring).
+
+### Exercise 14.1 — io_uring coroutine server
+
+Port Stage 13 to use `IoUringLoop`. The application code is identical:
+
+```cpp
+Task<void> handle(IoUringLoop& loop, int fd) {
+    std::array<std::byte, 4096> buf;
+    while (true) {
+        auto n = co_await loop.recv(fd, buf.data(), buf.size());
+        if (n <= 0) break;
+        co_await loop.send(fd, buf.data(), n);
+    }
+    ::close(fd);
+}
+```
+
+Only `loop.recv` and `loop.send` differ internally — they submit SQEs instead of registering epoll interest.
+
+**What you learn:** the loop is an implementation detail. When the awaitable interface is the same, the application code is portable across epoll and io_uring with zero changes. This is the payoff of the layering built across all previous stages.
+
+### Exercise 14.2 — Final benchmark
+
+Compare all four server implementations across the same load test from 11.2:
+
+| Server          | Throughput | p50 latency | p99 latency | App code lines |
+|-----------------|------------|-------------|-------------|----------------|
+| Stage 11: epoll |            |             |             |                |
+| Stage 12: uring |            |             |             |                |
+| Stage 13: coro+epoll |       |             |             |                |
+| Stage 14: coro+uring |       |             |             |                |
+
+Fill in the table from your measurements. The "app code lines" column counts only the connection handler (not the loop infrastructure) — it makes the coroutine abstraction cost visible.
