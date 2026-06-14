@@ -17,8 +17,31 @@ struct EventLoop {
     void run();  // jump to next due tick, fire all callbacks there, repeat
 };
 
+void EventLoop::schedule(int delay, std::function<void()> cb) {
+    pq_.push({tick_ + delay, cb});
+}
+
+void EventLoop::run() {
+    while (!pq_.empty()) {
+        auto e = pq_.top();
+        int next_tick = e.tick;
+        tick_ = std::max(tick_, next_tick);
+        while(!pq_.empty() && pq_.top().tick <= tick_) {
+            e = pq_.top();
+            pq_.pop();
+            e.cb();
+            tick_++;
+        }
+    }
+}
+
 // Print ping #n, then re-schedule itself until n == 3.
-void ping(EventLoop& loop, int n);
+void ping(EventLoop& loop, int n) {
+    printf("[tick %d] ping #%d\n", loop.tick_, n);
+    if (n < 3) {
+        loop.schedule(1, [&loop, n] { ping(loop, n + 1); });
+    }
+}
 
 int main() {
     EventLoop loop;
