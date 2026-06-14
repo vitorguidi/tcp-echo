@@ -34,13 +34,27 @@ struct EventLoop {
 
 // ── Your work below ───────────────────────────────────────────────────────────
 
-// Submit an async disk read. Completes after 3 ticks.
-// Calls on_done with the raw data string.
-void async_read_disk(EventLoop& loop, std::function<void(std::string)> on_done);
+// Simulate reading a raw CSV record from disk: "42,alice,99"
+// Completes after 3 ticks; calls on_done with the raw record.
+void async_read_disk(EventLoop& loop, std::function<void(std::string)> on_done) {
+    printf("[tick %d] read_disk: submitted (latency = 3 ticks)\n", loop.tick_);
+    loop.schedule(3, [on_done]() { on_done("42,alice,99"); });
+}
 
-// Submit async processing of raw data. Completes after 2 ticks.
-// Calls on_done with the processed result string.
-void async_process(EventLoop& loop, std::string raw, std::function<void(std::string)> on_done);
+// Parse "id,name,score" into a human-readable summary.
+// Completes after 2 ticks; calls on_done with the result.
+void async_process(EventLoop& loop, std::string read_result, std::function<void(std::string)> on_done) {
+    printf("[tick %d] process: submitted read_result=\"%s\" (latency = 2 ticks)\n", loop.tick_, read_result.c_str());
+    loop.schedule(2, [read_result, on_done]() {
+        auto p1    = read_result.find(',');
+        auto p2    = read_result.find(',', p1 + 1);
+        auto id    = read_result.substr(0, p1);
+        auto name  = read_result.substr(p1 + 1, p2 - p1 - 1);
+        auto score = read_result.substr(p2 + 1);
+        on_done(name + " (id=" + id + ") scored " + score);
+    });
+    
+}
 
 // Wire the two operations in sequence using nested callbacks.
 //
@@ -50,17 +64,23 @@ void async_process(EventLoop& loop, std::string raw, std::function<void(std::str
 //   auto result = co_await async_process(loop, raw);
 //   on_result(result);
 //
-// Each lambda you write is the "rest of the coroutine" after that suspend point.
-// The loop resumes the coroutine by calling the lambda.
-// The lambda's captures are the coroutine's saved stack frame.
-void pipeline(EventLoop& loop, std::function<void(std::string)> on_result);
+// Each lambda is the "rest of the coroutine" after that suspend point.
+// The captured `raw` is the coroutine's saved stack frame — it keeps the
+// value alive across the tick gap between the two stages.
+void pipeline(EventLoop& loop, std::function<void(std::string)> on_result) {
+    async_read_disk(loop, [&](std::string raw) {
+        async_process(loop, raw, [&](std::string result) {
+            on_result(result);
+        });
+    });
+}
 
 int main() {
     EventLoop loop;
     // Expected output:
     // [tick 0] read_disk: submitted (latency = 3 ticks)
-    // [tick 3] process: submitted (latency = 2 ticks)
-    // [tick 5] pipeline done: ...
+    // [tick 3] process: submitted raw="42,alice,99" (latency = 2 ticks)
+    // [tick 5] pipeline done: alice (id=42) scored 99
     pipeline(loop, [&](std::string result) {
         printf("[tick %d] pipeline done: %s\n", loop.tick_, result.c_str());
     });

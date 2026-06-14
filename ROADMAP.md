@@ -214,25 +214,27 @@ Expected output (registration order does not matter — only deadlines do):
 Using the tick-based `EventLoop` (provided at the top of the file), implement three functions:
 
 ```cpp
-// Completes after 3 ticks; calls on_done with the raw data string.
+// Reads a raw CSV record "id,name,score" from disk. Completes after 3 ticks.
 void async_read_disk(EventLoop& loop, std::function<void(std::string)> on_done);
 
-// Completes after 2 ticks; calls on_done with the processed result string.
+// Parses "id,name,score" into a human-readable summary. Completes after 2 ticks.
+// `raw` is the value produced by async_read_disk and passed into this stage.
 void async_process(EventLoop& loop, std::string raw, std::function<void(std::string)> on_done);
 
 // Chains the two operations using nested callbacks, then calls on_result.
 void pipeline(EventLoop& loop, std::function<void(std::string)> on_result);
 ```
 
-The equivalent coroutine body is already in the file as a comment. Your job is to write the callback version that produces the same result:
+The data flows through explicitly: `async_read_disk` produces `"42,alice,99"`, which `pipeline` captures and passes as the `raw` argument to `async_process`. Inside `async_process`, the lambda captures `raw` by value so it stays alive across the 2-tick gap. That capture is what a coroutine frame does for you automatically.
 
+Expected output:
 ```
 [tick 0] read_disk: submitted (latency = 3 ticks)
-[tick 3] process: submitted (latency = 2 ticks)
-[tick 5] pipeline done: ...
+[tick 3] process: submitted raw="42,alice,99" (latency = 2 ticks)
+[tick 5] pipeline done: alice (id=42) scored 99
 ```
 
-**What you learn:** each nested lambda in `pipeline` is a *resume point* — the code the coroutine executes after it wakes up. The lambda's capture list is the coroutine's saved stack frame. `co_await` in Stage 9 has the compiler generate exactly this nesting automatically; here you write it by hand so the transformation is not magic.
+**What you learn:** each nested lambda in `pipeline` is a *resume point*. The value produced by one stage (`raw`) flows to the next as a captured variable — the closure keeps it alive across the tick gap, exactly as a coroutine frame keeps local variables alive across a `co_await`. In Stage 9, the compiler generates this closure and nesting automatically; here you write it by hand so the transformation is not magic.
 
 ---
 
