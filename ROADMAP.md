@@ -275,15 +275,6 @@ Build a full echo server using only io_uring ops: `prep_accept` → `prep_recv` 
 
 **What you learn:** io_uring turns the event loop inside-out — instead of "wait for readiness then call syscall", you submit the I/O op upfront and react to completion. This matches how hardware DMA works.
 
-### Exercise 6.3 — Fixed buffers
-Register a buffer pool with `io_uring_register_buffers`. Use `prep_recv_fixed` instead of `prep_recv`.
-
-- Allocate 4 buffers of 4KB each, register them
-- Round-robin buffer assignment per connection
-- Compare throughput with and without fixed buffers
-
-**What you learn:** registered buffers avoid per-op kernel/user memory mapping — the kernel pins the memory once at registration. Important for high-frequency small messages.
-
 ---
 
 ## Stage 7 — Coroutine Basics
