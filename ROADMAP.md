@@ -277,6 +277,143 @@ Build a full echo server using only io_uring ops: `prep_accept` → `prep_recv` 
 
 ---
 
+## C++20 Coroutines — Primer
+
+### What the compiler does to a coroutine function
+
+When the compiler sees `co_yield`, `co_await`, or `co_return` in a function body, it transforms that function into a state machine. The transformation involves three things:
+
+1. **A heap-allocated coroutine frame** — holds the promise, all locals that survive a suspension, and a resumption function pointer
+2. **A promise object** — your customization point, lives inside the frame
+3. **A coroutine handle** — a thin wrapper over a pointer to the frame; `sizeof(coroutine_handle<P>) == sizeof(void*)`
+
+### The call sequence when you invoke a coroutine function
+
+```
+Generator<int> gen = fibonacci();
+
+1. operator new(frame_size)                      // heap allocates the frame
+2. promise_type() constructed in-place
+3. handle = coroutine_handle::from_promise(promise)
+4. return_object = promise.get_return_object()   // creates your Generator<int>
+5. co_await promise.initial_suspend()
+   └─ suspend_always → suspends, returns return_object to caller
+   └─ suspend_never  → runs body until first co_yield/co_return, then returns
+6. return_object is returned to caller
+```
+
+`get_return_object()` is called **before** the body runs. That's why the Generator has the handle before the coroutine has done any work.
+
+### The promise_type contract
+
+```cpp
+struct promise_type {
+    Generator<T> get_return_object();
+    // Called first. Build the return object. Extract the handle via from_promise(*this).
+
+    auto initial_suspend();
+    // suspend_always → lazy (body doesn't run until first resume)
+    // suspend_never  → eager (body runs immediately on call)
+
+    auto final_suspend() noexcept;   // MUST be noexcept
+    // suspend_always → frame stays alive; caller must call handle.destroy()
+    // suspend_never  → frame freed automatically; handle is dangling after this
+
+    void unhandled_exception();
+    // Called if an exception escapes the body. Usually: std::terminate()
+    // or store std::current_exception() and rethrow on next access.
+
+    void return_void();         // required if co_return; with no value
+    void return_value(T v);     // required if co_return expr;
+
+    auto yield_value(T v);
+    // co_yield expr  ≡  co_await promise.yield_value(expr)
+    // Store v, return suspend_always to pause or suspend_never to continue.
+};
+```
+
+### The awaitable contract
+
+Every `co_await expr` goes through this protocol:
+
+```
+1. awaitable = expr  (or promise.await_transform(expr) if that exists)
+2. if awaiter.await_ready()  → skip suspension, jump to 5
+3. awaiter.await_suspend(handle)
+       void return   → suspend, return control to caller
+       bool return   → false=suspend, true=resume immediately
+       handle return → tail-resume that other coroutine (symmetric transfer)
+4. [caller runs; eventually someone calls handle.resume()]
+5. result = awaiter.await_resume()    // the value of the co_await expression
+```
+
+`suspend_always` has `await_ready() = false` (always suspends).
+`suspend_never` has `await_ready() = true` (never suspends).
+
+### What `co_yield a` does step by step
+
+```
+co_yield a;
+  ├─ calls promise.yield_value(a)     // stores a, returns suspend_always
+  └─ co_await suspend_always
+       await_ready() → false
+       await_suspend(handle)          // control returns to whoever called resume()
+       [suspended]
+       ... handle.resume() called by caller ...
+       await_resume() → void
+       execution continues after co_yield
+```
+
+### The coroutine handle API
+
+```cpp
+handle.resume()                          // run until next suspension point
+handle.done()                            // true if at final suspension point
+handle.destroy()                         // free the frame (do this in your destructor)
+handle.promise()                         // reference to the promise — read yielded values here
+coroutine_handle<P>::from_promise(p)     // get handle from promise (used in get_return_object)
+```
+
+### Memory
+
+**Allocation:** one `operator new(frame_size)` per coroutine invocation. The frame holds the promise, all locals that live across a suspension point, and the current suspension state. Size is a compile-time constant.
+
+**HALO (Heap Allocation ELision Optimization):** if the compiler can prove the coroutine's lifetime is bounded by the caller's frame, it can put the frame on the stack instead. Not guaranteed.
+
+**Freeing:**
+- `final_suspend` returns `suspend_never` → frame freed automatically when body ends
+- `final_suspend` returns `suspend_always` → frame lives until `handle.destroy()` is called (put this in your destructor)
+
+**Customizing allocation:** add `operator new` / `operator delete` to `promise_type` for arena or pool allocation.
+
+### Full lifecycle for the fibonacci generator
+
+```
+gen = fibonacci()
+  → frame allocated
+  → promise constructed
+  → get_return_object() → Generator{handle}
+  → initial_suspend() → suspend_always → suspended; Generator returned to caller
+
+gen.next() → handle.resume()
+  → body runs: a=0, b=1
+  → co_yield 0 → promise.yield_value(0) stores 0 → suspended
+  → resume() returns
+
+gen.value() → handle.promise().value_ → 0
+
+~Generator()
+  → handle_.destroy() → promise destructor → frame freed
+```
+
+### Two things that trip people up
+
+**1. `get_return_object` runs before the body.** If your type stores data the body would initialize, it won't be there yet at construction.
+
+**2. `final_suspend` must return `suspend_always` in any type that controls its own lifetime.** If it returns `suspend_never`, the frame is freed before the caller's destructor runs `handle.destroy()` — double free.
+
+---
+
 ## Stage 7 — Coroutine Basics
 
 **Goal:** understand C++20 coroutines as a language feature, in complete isolation from networking.
