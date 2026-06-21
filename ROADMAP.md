@@ -7,12 +7,8 @@
               ↓
               6              (io_uring + sockets: needs epoll for motivation)
          5 → 7               (coroutine basics: needs callbacks from Stage 5)
-    4 + 7 → 8                (coroutines + epoll)
-    6 + 7 → 9                (coroutines + io_uring)
          4 → 10              (full echo server: epoll)
          6 → 11              (full echo server: io_uring)
-         8 → 12              (full echo server: coroutines + epoll)
-         9 → 13              (full echo server: coroutines + io_uring)
 ```
 
 ## Stage 1 — Raw TCP Sockets (blocking)
@@ -467,80 +463,5 @@ Implement `Task<int>` where `co_return 42` stores the value and the caller retri
 - Print the value from `main`
 
 **What you learn:** `co_await task` suspends the outer coroutine, runs the inner, then resumes with the result. This is structured concurrency — no callbacks, no shared state, sequential-looking code that is async underneath.
-
----
-
-## Stage 8 — Coroutines + epoll
-
-**Goal:** wire the coroutine machinery from Stage 7 to the epoll event loop from Stage 4.
-
-**Prerequisites:** Stage 4 (epoll + sockets) + Stage 7 (coroutine basics).
-
-### Exercise 8.1 — Awaitable fd read
-Write an `AsyncRead` awaitable that suspends a coroutine until epoll signals a fd is readable.
-
-```cpp
-Task<ssize_t> async_read(EventLoop& loop, int fd, char* buf, size_t len) {
-    co_await loop.wait_readable(fd);   // suspends here
-    co_return ::read(fd, buf, len);    // resumes when epoll fires
-}
-```
-
-- `wait_readable(fd)` registers the fd with epoll and stores the coroutine handle
-- When epoll fires, the event loop calls `handle.resume()`
-
-**What you learn:** epoll becomes the scheduler. The coroutine handle replaces a registered callback — instead of registering a lambda, you register a suspended coroutine.
-
-### Exercise 8.2 — Coroutine echo server
-Rewrite the echo server from Stage 4 using coroutines. Each connection gets its own coroutine.
-
-```cpp
-Task<void> handle_connection(EventLoop& loop, int fd) {
-    char buf[1024];
-    while (true) {
-        auto n = co_await async_read(loop, fd, buf, sizeof(buf));
-        if (n <= 0) break;
-        co_await async_write(loop, fd, buf, n);
-    }
-}
-```
-
-- Compare code length and structure with the raw epoll version from Stage 4
-- Observe how coroutines eliminate manual fd-to-state routing
-
-**What you learn:** in Stage 4 you manually tracked which fd was readable and dispatched to the right handler. Here the coroutine frame *is* the per-connection state — no routing map, no split across multiple functions. The sequential-looking code IS the state machine.
-
----
-
-## Stage 9 — Coroutines + io_uring
-
-**Goal:** replace the epoll event loop with io_uring as the coroutine scheduler.
-
-**Prerequisites:** Stage 6 (io_uring + sockets) + Stage 7 (coroutine basics).
-
-### Exercise 9.1 — Awaitable io_uring op
-Write an `IoUringAwaitable` that submits an SQE and suspends until the CQE arrives.
-
-```cpp
-Task<ssize_t> async_read(IoUringLoop& loop, int fd, char* buf, size_t len) {
-    co_return co_await loop.read(fd, buf, len);
-    // submits SQE with user_data = coroutine_handle
-    // resumes when CQE arrives with user_data
-}
-```
-
-- Store the coroutine handle in `sqe->user_data`
-- In the event loop: `io_uring_wait_cqe` → cast `cqe->user_data` back to `coroutine_handle` → `resume()`
-
-**What you learn:** io_uring and coroutines are a natural fit — the CQE is a completion notification, the coroutine handle is the continuation. `user_data` is the glue. No callbacks, no lambdas.
-
-### Exercise 9.2 — Coroutine echo server with io_uring
-Port the coroutine echo server from 8.2 to use io_uring instead of epoll.
-
-- `async_accept`, `async_recv`, `async_send` all submit SQEs
-- The loop just drains CQEs and resumes handles
-- Try chaining: submit the next recv SQE in the send completion (linked SQEs via `IOSQE_IO_LINK`)
-
-**What you learn:** with io_uring + coroutines, the server is: submit work → sleep → work arrives → continue. No readiness polling, no manual non-blocking loops, no `EAGAIN`. The closest thing to blocking code that is actually async.
 
 ---
